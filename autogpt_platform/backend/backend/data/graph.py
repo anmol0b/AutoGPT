@@ -3,7 +3,6 @@ import uuid
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
-from prisma import Json
 from prisma.enums import SubmissionStatus
 from prisma.models import AgentGraph, AgentNode, AgentNodeLink, StoreListingVersion
 from prisma.types import (
@@ -13,7 +12,7 @@ from prisma.types import (
     AgentNodeLinkCreateInput,
     StoreListingVersionWhereInput,
 )
-from pydantic import JsonValue, create_model
+from pydantic import Field, JsonValue, create_model
 from pydantic.fields import computed_field
 
 from backend.blocks.agent import AgentExecutorBlock
@@ -28,6 +27,7 @@ from backend.data.model import (
 )
 from backend.integrations.providers import ProviderName
 from backend.util import type as type_utils
+from backend.util.json import SafeJson
 
 from .block import Block, BlockInput, BlockSchema, BlockType, get_block, get_blocks
 from .db import BaseDbModel, query_raw_with_schema, transaction
@@ -188,6 +188,23 @@ class BaseGraph(BaseDbModel):
             )
         )
 
+    @computed_field
+    @property
+    def has_external_trigger(self) -> bool:
+        return self.webhook_input_node is not None
+
+    @property
+    def webhook_input_node(self) -> Node | None:
+        return next(
+            (
+                node
+                for node in self.nodes
+                if node.block.block_type
+                in (BlockType.WEBHOOK, BlockType.WEBHOOK_MANUAL)
+            ),
+            None,
+        )
+
     @staticmethod
     def _generate_schema(
         *props: tuple[type[AgentInputBlock.Input] | type[AgentOutputBlock.Input], dict],
@@ -195,9 +212,9 @@ class BaseGraph(BaseDbModel):
         schema_fields: list[AgentInputBlock.Input | AgentOutputBlock.Input] = []
         for type_class, input_default in props:
             try:
-                schema_fields.append(type_class(**input_default))
+                schema_fields.append(type_class.model_construct(**input_default))
             except Exception as e:
-                logger.warning(f"Invalid {type_class}: {input_default}, {e}")
+                logger.error(f"Invalid {type_class}: {input_default}, {e}")
 
         return {
             "type": "object",
@@ -325,11 +342,6 @@ class GraphModel(Graph):
     user_id: str
     nodes: list[NodeModel] = []  # type: ignore
 
-    @computed_field
-    @property
-    def has_webhook_trigger(self) -> bool:
-        return self.webhook_input_node is not None
-
     @property
     def starting_nodes(self) -> list[NodeModel]:
         outbound_nodes = {link.sink_id for link in self.links}
@@ -342,17 +354,12 @@ class GraphModel(Graph):
             if node.id not in outbound_nodes or node.id in input_nodes
         ]
 
-    @property
-    def webhook_input_node(self) -> NodeModel | None:
-        return next(
-            (
-                node
-                for node in self.nodes
-                if node.block.block_type
-                in (BlockType.WEBHOOK, BlockType.WEBHOOK_MANUAL)
-            ),
-            None,
-        )
+    def meta(self) -> "GraphMeta":
+        """
+        Returns a GraphMeta object with metadata about the graph.
+        This is used to return metadata about the graph without exposing nodes and links.
+        """
+        return GraphMeta.from_graph(self)
 
     def reassign_ids(self, user_id: str, reassign_graph_id: bool = False):
         """
@@ -611,6 +618,18 @@ class GraphModel(Graph):
         )
 
 
+class GraphMeta(Graph):
+    user_id: str
+
+    # Easy work-around to prevent exposing nodes and links in the API response
+    nodes: list[NodeModel] = Field(default=[], exclude=True)  # type: ignore
+    links: list[Link] = Field(default=[], exclude=True)
+
+    @staticmethod
+    def from_graph(graph: GraphModel) -> "GraphMeta":
+        return GraphMeta(**graph.model_dump())
+
+
 # --------------------- CRUD functions --------------------- #
 
 
@@ -639,10 +658,10 @@ async def set_node_webhook(node_id: str, webhook_id: str | None) -> NodeModel:
     return NodeModel.from_db(node)
 
 
-async def get_graphs(
+async def list_graphs(
     user_id: str,
     filter_by: Literal["active"] | None = "active",
-) -> list[GraphModel]:
+) -> list[GraphMeta]:
     """
     Retrieves graph metadata objects.
     Default behaviour is to get all currently active graphs.
@@ -652,7 +671,7 @@ async def get_graphs(
         user_id: The ID of the user that owns the graph.
 
     Returns:
-        list[GraphModel]: A list of objects representing the retrieved graphs.
+        list[GraphMeta]: A list of objects representing the retrieved graphs.
     """
     where_clause: AgentGraphWhereInput = {"userId": user_id}
 
@@ -666,13 +685,13 @@ async def get_graphs(
         include=AGENT_GRAPH_INCLUDE,
     )
 
-    graph_models = []
+    graph_models: list[GraphMeta] = []
     for graph in graphs:
         try:
-            graph_model = GraphModel.from_db(graph)
-            # Trigger serialization to validate that the graph is well formed.
-            graph_model.model_dump()
-            graph_models.append(graph_model)
+            graph_meta = GraphModel.from_db(graph).meta()
+            # Trigger serialization to validate that the graph is well formed
+            graph_meta.model_dump()
+            graph_models.append(graph_meta)
         except Exception as e:
             logger.error(f"Error processing graph {graph.id}: {e}")
             continue
@@ -933,18 +952,18 @@ async def fork_graph(graph_id: str, graph_version: int, user_id: str) -> GraphMo
     """
     Forks a graph by copying it and all its nodes and links to a new graph.
     """
+    graph = await get_graph(graph_id, graph_version, user_id, True)
+    if not graph:
+        raise ValueError(f"Graph {graph_id} v{graph_version} not found")
+
+    # Set forked from ID and version as itself as it's about ot be copied
+    graph.forked_from_id = graph.id
+    graph.forked_from_version = graph.version
+    graph.name = f"{graph.name} (copy)"
+    graph.reassign_ids(user_id=user_id, reassign_graph_id=True)
+    graph.validate_graph(for_run=False)
+
     async with transaction() as tx:
-        graph = await get_graph(graph_id, graph_version, user_id, True)
-        if not graph:
-            raise ValueError(f"Graph {graph_id} v{graph_version} not found")
-
-        # Set forked from ID and version as itself as it's about ot be copied
-        graph.forked_from_id = graph.id
-        graph.forked_from_version = graph.version
-        graph.name = f"{graph.name} (copy)"
-        graph.reassign_ids(user_id=user_id, reassign_graph_id=True)
-        graph.validate_graph(for_run=False)
-
         await __create_graph(tx, graph, user_id)
 
     return graph
@@ -976,8 +995,8 @@ async def __create_graph(tx, graph: Graph, user_id: str):
                 agentGraphId=graph.id,
                 agentGraphVersion=graph.version,
                 agentBlockId=node.block_id,
-                constantInput=Json(node.input_default),
-                metadata=Json(node.metadata),
+                constantInput=SafeJson(node.input_default),
+                metadata=SafeJson(node.metadata),
             )
             for graph in graphs
             for node in graph.nodes
@@ -1102,7 +1121,7 @@ async def fix_llm_provider_credentials():
         await store.update_creds(user_id, credentials)
         await AgentNode.prisma().update(
             where={"id": node_id},
-            data={"constantInput": Json(node_preset_input)},
+            data={"constantInput": SafeJson(node_preset_input)},
         )
 
 
